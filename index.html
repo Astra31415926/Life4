@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ZEBRA · v8 SCANNER</title>
+<title>ZEBRA · v9 SCANNER</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:#060608;color:#9a9aaa;font:11px/1.6 'Courier New',monospace}
@@ -44,13 +44,20 @@ input[type=file]{display:none}
 .rgb-lbl{font-size:9px;letter-spacing:2px;text-align:center;color:#3a5a7a}
 .lh{color:#2a6090;margin-top:5px}.lok{color:#2a7a3a}.lw{color:#8a6010}.le{color:#8a2020}.li{color:#6a6a8a}
 .ls2{color:#806020}.lcam{color:#9060b0}
+/* ── Мобільна вёрстка ── */
+@media(max-width:700px){
+  html,body{height:auto;overflow:auto}
+  #app{grid-template-columns:1fr;grid-template-rows:auto auto;height:auto;min-height:100vh;overflow:visible}
+  #left{height:55vh;min-height:260px;border-right:none;border-bottom:1px solid #141420}
+  #right{height:45vh;min-height:240px}
+}
 </style>
 </head>
 <body>
 <div id="app">
   <div id="left">
     <div id="topbar">
-      <h1>ZEBRA·v8</h1>
+      <h1>ZEBRA·v9</h1>
       <label class="btn">▶ Файл<input type="file" id="fin" accept="image/*"></label>
       <button class="btn" id="camBtn">◎ Сканувати</button>
       <button class="btn" id="stopBtn" style="display:none">■ Стоп</button>
@@ -94,12 +101,12 @@ input[type=file]{display:none}
 // ═══════════════════════════════════════════════════
 //  НАЛАШТУВАННЯ СТИКУВАННЯ (не чіпають самі алгоритми)
 // ═══════════════════════════════════════════════════
-const GATE_CONF   = 0.30;  // мінімальна впевненість зебри, щоб вважати S1 успіхом
-const CROP_SIZE   = 500;   // розмір вирізки Scanner v6
-const CROP_MARGIN = 35;    // біле поле навколо вирізки (щоб v6.2 знайшла фон)
-const CAM_FPS_MS  = 500;   // 2 кадри/сек
-const CAM_TIMEOUT = 5000;  // 5 секунд
-const CAM_MAXSIDE = 900;   // робоче розширення кадру
+const GATE_MIN_RATIO = 1.5;  // мінімальний відрив лідера голосів для пропуску гейту
+const CROP_SIZE   = 500;     // розмір вирізки Scanner v6
+const CROP_MARGIN = 35;      // біле поле навколо вирізки (щоб v6.2 знайшла фон)
+const CAM_FPS_MS  = 500;     // 2 кадри/сек
+const CAM_TIMEOUT = 5000;    // 5 секунд
+const CAM_MAXSIDE = 900;     // початкове робоче розширення кадру
 
 // ═══════════════════════════════════════════════════
 //  LOG
@@ -136,6 +143,38 @@ function onCvReady(){
   el.textContent='✅ OpenCV.js готовий';
   el.style.color='#2a7a3a';
   setTimeout(()=>el.classList.add('hidden'),2500);
+}
+
+// ═══════════════════════════════════════════════════
+//  ГЕЙТ: парсинг рядка голосів
+//  Надстройка оркестратора — verifyZebra не чіпаємо
+// ═══════════════════════════════════════════════════
+function parseVoteStr(voteStr){
+  if(!voteStr)return null;
+  const matches=[...voteStr.matchAll(/T\d+:(\d+)/g)].map(m=>parseInt(m[1]));
+  if(!matches.length)return null;
+  const leader=matches[0],second=matches[1]??0;
+  return{leader,second,ratio:second>0?leader/second:Infinity};
+}
+
+// ═══════════════════════════════════════════════════
+//  ОЦІНКА КАНДИДАТА (для накопичення найкращого за сесію)
+// ═══════════════════════════════════════════════════
+function scoreCandidate(r,v6tc){
+  if(!r||!r.zebra)return 0;
+  let score=0;
+  const vr=parseVoteStr(r.zebra.voteStr);
+  if(vr)score+=Math.min(vr.ratio,8)*10;   // відрив: до 80 балів
+  if(v6tc!=null&&r.zebra.T){
+    const rel=Math.abs(v6tc-r.zebra.T)/Math.max(r.zebra.T,1);
+    if(rel<0.10)score+=40;
+    else if(rel<0.20)score+=20;
+  }
+  if(r.decoded){
+    if(r.decoded.channels)score+=r.decoded.channels*10;
+    if(r.decoded.text)score+=100;
+  }
+  return score;
 }
 
 // ═══════════════════════════════════════════════════
@@ -194,7 +233,6 @@ function gaussianBlur(idata,w,h,passes=1){
   return out;
 }
 
-// ── препроцесинг з canvas (спільний для галереї і камери) ──
 function preprocessCanvas(srcCanvas,maxSide,quiet){
   let w=srcCanvas.width,h=srcCanvas.height;
   if(maxSide&&Math.max(w,h)>maxSide){const s=maxSide/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s);}
@@ -386,8 +424,12 @@ function buildRGBPanel(warped,S,T,modSize,circles){
 
 // ═══════════════════════════════════════════════════
 //  ЯДРО v6.2: читання підготовленого ImageData
+//
+//  ГЕЙТ v9: відрив лідера голосів (не абсолютний conf)
+//  + кросс-перевірка з v6 totalCells.
+//  verifyZebra не чіпаємо — вся логіка зовні.
 // ═══════════════════════════════════════════════════
-function decodePipeline(idata,w,h,quiet){
+function decodePipeline(idata,w,h,quiet,v6tc){
   if(!quiet)Lh('ПОШУК РАМКИ');
   const{corners,spread:sp}=findFrame(idata,w,h,quiet);
   if(!corners||sp<20){
@@ -411,10 +453,23 @@ function decodePipeline(idata,w,h,quiet){
   if(!zebra){if(!quiet)Le('Зебру не знайдено');return{success:false,reason:'зебру не знайдено',warped,S,idata,w,h,corners:c};}
   if(!quiet)Lok('T='+zebra.T+'  mod='+zebra.modSize.toFixed(1)+'px  conf='+(zebra.confidence*100).toFixed(0)+'%');
 
-  // ── ГЕЙТ ЯКОСТІ: низька впевненість = випадкове збігання, не результат ──
-  if(zebra.confidence<GATE_CONF){
-    if(!quiet)Lw('ГЕЙТ: conf='+(zebra.confidence*100).toFixed(0)+'% < '+(GATE_CONF*100)+'% — зебра ненадійна');
-    return{success:false,reason:'conf '+(zebra.confidence*100).toFixed(0)+'% нижче гейту',warped,S,zebra,idata,w,h,corners:c,gateFail:true};
+  // ── ГЕЙТ ЯКОСТІ (надстройка оркестратора) ──
+  // Критерій: відрив лідера голосів, а не абсолютний conf.
+  // conf=17% при T65:4/T27:2 (відрив 2×) — правильне читання, гейт пропускає.
+  // T13:2/T21:2 — ничья (відрив 1×) — гейт відхиляє.
+  const vRatio=parseVoteStr(zebra.voteStr);
+  const hasStrongLeader=vRatio!=null&&vRatio.ratio>=GATE_MIN_RATIO;
+  const hasV6Agree=v6tc!=null&&Math.abs(v6tc-zebra.T)/Math.max(zebra.T,1)<0.15;
+  if(!hasStrongLeader&&!hasV6Agree){
+    if(!quiet){
+      const rs=vRatio?'відрив='+vRatio.ratio.toFixed(1)+'× ('+vRatio.leader+':'+vRatio.second+')':'голосів нема';
+      Lw('ГЕЙТ: '+rs+(v6tc!=null?' | v6tc='+v6tc:'')+'  — ненадійний лідер');
+    }
+    return{success:false,reason:'ненадійний лідер',warped,S,zebra,idata,w,h,corners:c,gateFail:true};
+  }
+  if(!quiet){
+    if(hasStrongLeader)Lok('ГЕЙТ ✓ відрив '+vRatio.ratio.toFixed(1)+'× ('+vRatio.leader+':'+vRatio.second+')');
+    if(hasV6Agree)Lok('ГЕЙТ ✓ погодження v6  T='+zebra.T+' vs tc='+v6tc);
   }
 
   if(!quiet)Lh('КРУЖЕЧКИ');
@@ -445,7 +500,9 @@ function paintResult(r){
 
 // ═══════════════════════════════════════════════════
 //  SCANNER v6 — локалізація через OpenCV
-//  Вирізає зону + додає БІЛЕ ПОЛЕ, щоб v6.2 знайшла фон
+//  Вирізає зону + БІЛЕ ПОЛЕ
+//  Повертає {canvas, totalCells} або null
+//  (totalCells — незалежна оцінка розміру сітки для гейту)
 // ═══════════════════════════════════════════════════
 function orderCorners(pts){
   const cx=pts.reduce((s,p)=>s+p.x,0)/4;
@@ -511,7 +568,6 @@ function analyseQuad(gray,pts){
   finally{[srcTri,dstTri,M,warped,wbin].forEach(m=>{try{if(m)m.delete();}catch(e){}});}
 }
 
-// Повертає canvas CROP_SIZE×CROP_SIZE: код усередині + біле поле, або null
 function scannerLocate(srcCanvas,quiet){
   let src,gray,blur,bin,contours,hier;
   const mats=[];
@@ -559,7 +615,7 @@ function scannerLocate(srcCanvas,quiet){
       if(!best||res.score>best.score)best={...res,pts:q.pts};
     }
     if(!best||best.score<0.35){if(!quiet)Ls2('Зебра-патерн не підтверджено');return null;}
-    if(!quiet)Ls2('Score='+best.score.toFixed(3)+' сітка '+best.gridN+'×'+best.gridN);
+    if(!quiet)Ls2('Score='+best.score.toFixed(3)+' сітка '+best.gridN+'×'+best.gridN+' tc='+best.totalCells);
 
     // ── Вирізка з БІЛИМ ПОЛЕМ ──
     const P=best.pts,M0=CROP_MARGIN,E=CROP_SIZE-CROP_MARGIN;
@@ -574,8 +630,8 @@ function scannerLocate(srcCanvas,quiet){
         cv.INTER_LINEAR,cv.BORDER_CONSTANT,new cv.Scalar(255,255,255,255));
       const out=document.createElement('canvas');out.width=CROP_SIZE;out.height=CROP_SIZE;
       cv.imshow(out,dst);
-      if(!quiet)Ls2('Вирізано '+CROP_SIZE+'×'+CROP_SIZE+' (поле '+M0+'px)');
-      return out;
+      if(!quiet)Ls2('Вирізано '+CROP_SIZE+'×'+CROP_SIZE+' (поле '+M0+'px, tc='+best.totalCells+')');
+      return{canvas:out,totalCells:best.totalCells};
     }finally{[src2,dst,st,dt,M2].forEach(m=>{try{if(m)m.delete();}catch(e){}});}
   }catch(e){
     if(!quiet)Ls2('Помилка OpenCV: '+e);return null;
@@ -595,7 +651,7 @@ function processGallery(img,orient){
 
   Lh('═ СЦЕНАРІЙ 1 · v6.2 напряму ═');
   const{idata,w,h}=preprocess(img,orient,900);
-  const r1=decodePipeline(idata,w,h,false);
+  const r1=decodePipeline(idata,w,h,false,null);
 
   if(r1.success){
     paintResult(r1);
@@ -614,18 +670,19 @@ function processGallery(img,orient){
 
   const srcCanvas=(orient&&orient!==1)?applyExifRotation(img,orient):(()=>{const c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;c.getContext('2d').drawImage(img,0,0);return c;})();
 
-  const crop=scannerLocate(srcCanvas,false);
-  if(!crop){
+  const located=scannerLocate(srcCanvas,false);
+  if(!located){
     Le('Scanner v6 не знайшов зону');
     setSt('⚠ обидва сценарії без результату',null,'s2');
     return;
   }
 
-  // ВАЖЛИВО: вирізку теж проганяємо через препроцесинг
+  const{canvas:cropCanvas,totalCells:v6tc}=located;
+
   Lh('Препроцесинг вирізки');
-  const pp=preprocessCanvas(crop,null,false);
+  const pp=preprocessCanvas(cropCanvas,null,false);
   Lh('v6.2 на вирізаній зоні');
-  const r2=decodePipeline(pp.idata,pp.w,pp.h,false);
+  const r2=decodePipeline(pp.idata,pp.w,pp.h,false,v6tc);
   paintResult(r2);
 
   if(r2.success){
@@ -638,9 +695,12 @@ function processGallery(img,orient){
 }
 
 // ═══════════════════════════════════════════════════
-//  ГІЛКА Б — КАМЕРА: v6 локалізує → v6.2 читає (живий скан)
+//  ГІЛКА Б — КАМЕРА: v6 → v6.2 (живий скан)
+//  + накопичення найкращого кандидата за сесію
+//  + адаптація розширення за фактичним часом тіка
 // ═══════════════════════════════════════════════════
-let stream=null,scanTimer=null,scanDeadline=0,frameNo=0,lastAttempt=null;
+let stream=null,scanTimer=null,scanDeadline=0,frameNo=0;
+let lastAttempt=null,bestCandidate=null,camCurrentMaxSide=CAM_MAXSIDE;
 const vid=document.getElementById('vid');
 const vidWrap=document.getElementById('vidWrap');
 const camHud=document.getElementById('camHud');
@@ -649,7 +709,7 @@ function grabFrame(){
   const vw=vid.videoWidth,vh=vid.videoHeight;
   if(!vw||!vh)return null;
   let w=vw,h=vh;
-  if(Math.max(w,h)>CAM_MAXSIDE){const s=CAM_MAXSIDE/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s);}
+  if(Math.max(w,h)>camCurrentMaxSide){const s=camCurrentMaxSide/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s);}
   const c=document.createElement('canvas');c.width=w;c.height=h;
   c.getContext('2d').drawImage(vid,0,0,w,h);
   return c;
@@ -660,24 +720,35 @@ function scanTick(){
   const left=Math.max(0,Math.ceil((scanDeadline-now)/1000));
   camHud.innerHTML=left+'s<small>наведіть код у рамку</small>';
 
+  const tickStart=Date.now();
   const frame=grabFrame();
   if(frame){
     frameNo++;
-    // Крок 1: локалізація через Scanner v6
-    const crop=cvReady?scannerLocate(frame,true):null;
-    if(crop){
-      // Крок 2: препроцесинг + читання через v6.2
-      const pp=preprocessCanvas(crop,null,true);
-      const r=decodePipeline(pp.idata,pp.w,pp.h,true);
-      lastAttempt={frame,crop,r,frameNo};
-      if(r.success){
-        finishScan(true);
-        return;
+    const located=cvReady?scannerLocate(frame,true):null;
+    if(located){
+      const{canvas:cropCanvas,totalCells:v6tc}=located;
+      const pp=preprocessCanvas(cropCanvas,null,true);
+      const r=decodePipeline(pp.idata,pp.w,pp.h,true,v6tc);
+      const elapsed=Date.now()-tickStart;
+      const sc=scoreCandidate(r,v6tc);
+      lastAttempt={frame,crop:cropCanvas,r,frameNo,v6tc};
+      if(!bestCandidate||sc>bestCandidate.score){
+        bestCandidate={r,crop:cropCanvas,frame,frameNo,v6tc,score:sc};
       }
-      Lcam('кадр '+frameNo+': зону знайдено, декод — '+r.reason);
+      if(r.success){finishScan(true);return;}
+      Lcam('кадр '+frameNo+': '+r.reason+' | '+elapsed+'мс | оц='+sc.toFixed(0));
+      if(elapsed>CAM_FPS_MS*0.8&&camCurrentMaxSide>400){
+        camCurrentMaxSide=Math.max(400,camCurrentMaxSide-150);
+        Lcam('⚠ повільно ('+elapsed+'мс) → розширення ↓'+camCurrentMaxSide+'px');
+      }
     } else {
-      lastAttempt={frame,crop:null,r:null,frameNo};
-      Lcam('кадр '+frameNo+': зону не знайдено');
+      const elapsed=Date.now()-tickStart;
+      lastAttempt={frame,crop:null,r:null,frameNo,v6tc:null};
+      Lcam('кадр '+frameNo+': зону не знайдено | '+elapsed+'мс');
+      if(elapsed>CAM_FPS_MS*0.8&&camCurrentMaxSide>400){
+        camCurrentMaxSide=Math.max(400,camCurrentMaxSide-150);
+        Lcam('⚠ повільно ('+elapsed+'мс) → розширення ↓'+camCurrentMaxSide+'px');
+      }
     }
   }
 
@@ -695,26 +766,42 @@ function finishScan(ok){
   if(ok&&lastAttempt&&lastAttempt.r&&lastAttempt.r.success){
     const r=lastAttempt.r;
     Lh('═ УСПІХ на кадрі '+lastAttempt.frameNo+' ═');
-    // перезапускаємо з логами для діагностики
     const pp=preprocessCanvas(lastAttempt.crop,null,false);
-    const rr=decodePipeline(pp.idata,pp.w,pp.h,false);
+    const rr=decodePipeline(pp.idata,pp.w,pp.h,false,lastAttempt.v6tc);
     paintResult(rr.success?rr:r);
     Lok('═ РЕЗУЛЬТАТ: "'+r.decoded.text+'" ['+r.decoded.type+']');
     setSt('✓ "'+r.decoded.text+'"',true,'ok');
     return;
   }
 
-  // Невдача — показуємо ОСТАННІЙ кадр, який намагався прочитати декодер
-  Lh('═ 5с минуло — показую останній кадр ('+ (lastAttempt?('№'+lastAttempt.frameNo):'—') +') ═');
+  // Невдача — пробуємо найкращого кандидата за сесію
+  Lh('═ '+(CAM_TIMEOUT/1000)+'с минуло — кадрів оброблено: '+frameNo+' ═');
+
+  if(bestCandidate&&bestCandidate.crop){
+    Li('Найкращий кандидат: кадр №'+bestCandidate.frameNo+' (оцінка='+bestCandidate.score.toFixed(0)+')');
+    const pp=preprocessCanvas(bestCandidate.crop,null,false);
+    const rr=decodePipeline(pp.idata,pp.w,pp.h,false,bestCandidate.v6tc);
+    paintResult(rr);
+    if(rr.success){
+      Lok('═ РЕЗУЛЬТАТ: "'+rr.decoded.text+'" ['+rr.decoded.type+']');
+      setSt('✓ "'+rr.decoded.text+'"',true,'ok');
+      return;
+    }
+    Lw('Найкращий кандидат не прочитано: '+rr.reason);
+    setSt('⚠ не прочитано ('+rr.reason+')',null,'cam');
+    return;
+  }
+
+  // Fallback: останній кадр
   if(!lastAttempt){
     Le('Жодного кадру не отримано');
     setSt('✗ немає кадрів',false,'cam');
     return;
   }
   if(lastAttempt.crop){
-    Li('Зону було локалізовано, детальний розбір останньої спроби:');
+    Li('Розбір останнього локалізованого кадру:');
     const pp=preprocessCanvas(lastAttempt.crop,null,false);
-    const rr=decodePipeline(pp.idata,pp.w,pp.h,false);
+    const rr=decodePipeline(pp.idata,pp.w,pp.h,false,lastAttempt.v6tc);
     paintResult(rr);
     if(rr.success){
       Lok('═ РЕЗУЛЬТАТ: "'+rr.decoded.text+'" ['+rr.decoded.type+']');
@@ -728,7 +815,6 @@ function finishScan(ok){
     const ctx=mainCnv.getContext('2d');
     mainCnv.width=lastAttempt.frame.width;mainCnv.height=lastAttempt.frame.height;
     ctx.drawImage(lastAttempt.frame,0,0);
-    // повний розбір v6 з логами
     if(cvReady)scannerLocate(lastAttempt.frame,false);
     setSt('⚠ код не знайдено в кадрі',null,'cam');
   }
@@ -744,9 +830,9 @@ document.getElementById('camBtn').addEventListener('click',async()=>{
     document.getElementById('camBtn').style.display='none';
     document.getElementById('stopBtn').style.display='inline';
     Lh('═ СКАНУВАННЯ · v6 локалізує → v6.2 читає ═');
-    Li('2 кадри/сек, '+(CAM_TIMEOUT/1000)+' секунд');
+    Li('2 кадри/сек, '+(CAM_TIMEOUT/1000)+'с, розширення '+CAM_MAXSIDE+'px');
     setSt('◎ сканую…',null,'cam');
-    frameNo=0;lastAttempt=null;
+    frameNo=0;lastAttempt=null;bestCandidate=null;camCurrentMaxSide=CAM_MAXSIDE;
     scanDeadline=Date.now()+CAM_TIMEOUT;
     scanTimer=setInterval(scanTick,CAM_FPS_MS);
     scanTick();
